@@ -12,3 +12,7 @@ dependencies = [
     "openai-whisper>=20250625",
     "pyannote-audio>=4.0.4",
 ]
+
+[project.optional-dependencies]
+# System dependency: ffmpeg is required for audio processing
+# Install with: brew install ffmpeg (macOS), apt-get install ffmpeg (Ubuntu), etc.

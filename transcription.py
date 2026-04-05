@@ -26,10 +26,23 @@ Uso:
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from datetime import timedelta
 from pathlib import Path
+
+
+def check_dependencies() -> None:
+    """Verifica que ffmpeg esté instalado."""
+    if not shutil.which("ffmpeg"):
+        print("Error: ffmpeg no está instalado.", file=sys.stderr)
+        print("\nInstálalo con:", file=sys.stderr)
+        print("  macOS:  brew install ffmpeg", file=sys.stderr)
+        print("  Ubuntu: sudo apt-get install ffmpeg", file=sys.stderr)
+        print("  Fedora: sudo dnf install ffmpeg", file=sys.stderr)
+        print("  Arch:   sudo pacman -S ffmpeg", file=sys.stderr)
+        sys.exit(1)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -238,6 +251,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Verificar dependencias
+    check_dependencies()
 
     # Validaciones
     audio_path = Path(args.audio)
