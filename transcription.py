@@ -9,8 +9,9 @@ Requisitos:
 
 Antes de correrlo:
     1. Creá una cuenta en https://huggingface.co
-    2. Aceptá los términos de uso de estos dos modelos:
+    2. Aceptá los términos de uso de estos modelos (REQUERIDO):
        - https://huggingface.co/pyannote/speaker-diarization-3.1
+       - https://huggingface.co/pyannote/speaker-diarization-community-1
        - https://huggingface.co/pyannote/segmentation-3.0
     3. Generá un token en https://huggingface.co/settings/tokens
     4. Pasalo como argumento --hf-token o seteá la variable HF_TOKEN
@@ -55,16 +56,47 @@ def format_timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def save_transcription_cache(cache_path: str, transcription: dict) -> None:
+    """Guarda el resultado de la transcripción en caché."""
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(transcription, f)
+
+
+def load_transcription_cache(cache_path: str) -> dict:
+    """Carga el resultado de la transcripción desde caché."""
+    with open(cache_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_diarization_cache(cache_path: str, diarization: object) -> None:
+    """Guarda el resultado de la diarización en caché."""
+    import pickle
+    with open(cache_path, "wb") as f:
+        pickle.dump(diarization, f)
+
+
+def load_diarization_cache(cache_path: str) -> object:
+    """Carga el resultado de la diarización desde caché."""
+    import pickle
+    with open(cache_path, "rb") as f:
+        return pickle.load(f)
+
+
 def transcribe(audio_path: str, model_name: str, language: str) -> dict:
     """Transcribe audio con Whisper."""
+    import torch
     import whisper
 
     print(f"\n{'='*60}")
     print(f"  PASO 1/3: Transcribiendo con Whisper ({model_name})")
     print(f"{'='*60}\n")
 
+    # Force GPU usage
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"  Usando dispositivo: {device}")
+
     t0 = time.time()
-    model = whisper.load_model(model_name)
+    model = whisper.load_model(model_name, device=device)
     print(f"  Modelo cargado en {time.time() - t0:.1f}s")
 
     t0 = time.time()
@@ -78,17 +110,23 @@ def transcribe(audio_path: str, model_name: str, language: str) -> dict:
 
 def diarize(audio_path: str, hf_token: str, num_speakers: int = None) -> object:
     """Identifica speakers con pyannote."""
+    import torch
     from pyannote.audio import Pipeline
 
     print(f"\n{'='*60}")
     print(f"  PASO 2/3: Identificando speakers con pyannote")
     print(f"{'='*60}\n")
 
+    # Force GPU usage
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"  Usando dispositivo: {device}")
+
     t0 = time.time()
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
         token=hf_token,
     )
+    pipeline.to(torch.device(device))
     print(f"  Pipeline cargada en {time.time() - t0:.1f}s")
 
     t0 = time.time()
@@ -96,7 +134,8 @@ def diarize(audio_path: str, hf_token: str, num_speakers: int = None) -> object:
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
 
-    diarization = pipeline(audio_path, **kwargs)
+    output = pipeline(audio_path, **kwargs)
+    diarization = output.speaker_diarization
     elapsed = time.time() - t0
 
     speakers = set()
@@ -214,6 +253,26 @@ def export_json(segments: list, output_path: str):
     print(f"  JSON: {output_path}")
 
 
+def export_md(segments: list, output_path: str):
+    """Exporta a Markdown."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        # Header
+        f.write("# Transcripción\n\n")
+
+        # Speakers summary
+        speakers = sorted(set(seg["speaker"] for seg in segments))
+        f.write(f"**Speakers:** {', '.join(speakers)}\n\n")
+
+        # Content
+        f.write("---\n\n")
+        for seg in segments:
+            ts = format_timestamp(seg["start"])
+            f.write(f"**[{ts}] {seg['speaker']}**\n\n")
+            f.write(f"{seg['text']}\n\n")
+
+    print(f"  Markdown: {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Transcribir y separar voces de una reunión"
@@ -268,14 +327,17 @@ def main():
         print()
         print("Para obtener uno:")
         print("  1. https://huggingface.co/settings/tokens")
-        print("  2. Aceptá los modelos:")
+        print("  2. Aceptá estos modelos (REQUERIDO):")
         print("     - https://huggingface.co/pyannote/speaker-diarization-3.1")
+        print("     - https://huggingface.co/pyannote/speaker-diarization-community-1")
         print("     - https://huggingface.co/pyannote/segmentation-3.0")
         sys.exit(1)
 
     output_dir = Path(args.output_dir) if args.output_dir else audio_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
+    transcription_cache_path = output_dir / f"{stem}_transcription_cache.json"
+    diarization_cache_path = output_dir / f"{stem}_diarization_cache.pkl"
 
     # Parse rename map
     rename_map = {}
@@ -287,11 +349,36 @@ def main():
     # === Pipeline ===
     total_t0 = time.time()
 
-    # 1. Transcribir
-    transcription = transcribe(str(audio_path), args.model, args.language)
+    # 1. Transcribir (o cargar desde caché)
+    if transcription_cache_path.exists():
+        print(f"\n{'='*60}")
+        print(f"  PASO 1/3: Cargando transcripción desde caché")
+        print(f"{'='*60}\n")
+        transcription = load_transcription_cache(str(transcription_cache_path))
+        print(f"  Transcripción cargada desde caché")
+        print(f"  Segmentos: {len(transcription['segments'])}")
+        print(f"\n  💡 Para empezar desde el principio, eliminá los cachés:")
+        print(f"     rm {transcription_cache_path} {diarization_cache_path}\n")
+    else:
+        transcription = transcribe(str(audio_path), args.model, args.language)
+        save_transcription_cache(str(transcription_cache_path), transcription)
 
-    # 2. Diarizar
-    diarization = diarize(str(audio_path), args.hf_token, args.num_speakers)
+    # 2. Diarizar (o cargar desde caché)
+    if diarization_cache_path.exists():
+        print(f"\n{'='*60}")
+        print(f"  PASO 2/3: Cargando diarización desde caché")
+        print(f"{'='*60}\n")
+        diarization = load_diarization_cache(str(diarization_cache_path))
+        print(f"  Diarización cargada desde caché")
+        speakers = set()
+        for _, _, label in diarization.itertracks(yield_label=True):
+            speakers.add(label)
+        print(f"  Speakers detectados: {len(speakers)} ({', '.join(sorted(speakers))})")
+        print(f"\n  💡 Para empezar desde el principio, eliminá los cachés:")
+        print(f"     rm {transcription_cache_path} {diarization_cache_path}\n")
+    else:
+        diarization = diarize(str(audio_path), args.hf_token, args.num_speakers)
+        save_diarization_cache(str(diarization_cache_path), diarization)
 
     # 3. Combinar
     print(f"\n{'='*60}")
@@ -305,10 +392,11 @@ def main():
         segments = rename_speakers(segments, rename_map)
         print(f"  Speakers renombrados: {rename_map}")
 
-    # Exportar en los 3 formatos
+    # Exportar en los 4 formatos
     export_txt(segments, str(output_dir / f"{stem}_transcripcion.txt"))
     export_srt(segments, str(output_dir / f"{stem}_transcripcion.srt"))
     export_json(segments, str(output_dir / f"{stem}_transcripcion.json"))
+    export_md(segments, str(output_dir / f"{stem}_transcripcion.md"))
 
     total_elapsed = time.time() - total_t0
 
